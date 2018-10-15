@@ -16,9 +16,10 @@ var catalogCmd = &cobra.Command{
 	Use:   "catalog [options]",
 	Short: "Catalog related operations",
 	Long:  "Catalog related operations",
-	Example: fmt.Sprintf("%s\n%s",
+	Example: fmt.Sprintf("%s\n%s\n%s",
 		catalogListCmd.Example,
-		catalogSearchCmd.Example),
+		catalogSearchCmd.Example,
+		catalogDescribeCmd.Example),
 }
 
 var catalogListCmd = &cobra.Command{
@@ -181,25 +182,23 @@ services from service catalog.
 
 var catalogDescribeCmd = &cobra.Command{
 	Use:   "describe",
-	Short: "describe given component or service types.",
-	Long:  "Describe given component or service types from OpenShift",
-	Example: `  # Get the supported components
-  odo catalog describe component
-
-  # Get the supported services from service catalog
-  odo catalog describe service
+	Short: "describe given service.",
+	Long:  "Describe given service from OpenShift",
+	Args:  cobra.ExactArgs(1),
+	Example: `  # Describe the given service
+  odo catalog describe service mysql-persistent
 `,
 }
 
 var catalogDescribeServiceCmd = &cobra.Command{
 	Use:   "service",
-	Short: "Search service type in catalog",
+	Short: "Describe service in catalog",
 	Long: `Describe a service type.
 
 This describes the service and the associated plans.
 `,
 	Example: `  # Describe a service
-  odo catalog describe service mysql
+  odo catalog describe service mysql-persistent
 	`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
