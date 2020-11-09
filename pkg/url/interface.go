@@ -17,26 +17,106 @@ import (
 	"strings"
 )
 
+type comp interface {
+	GetURLs() map[string]url
+	Push() error
+	GetName() string
+	GetApplication() string
+	AddUrl(infoURL *envinfo.EnvInfoURL) url
+}
+
+type devfileComp struct {
+	urls       map[string]url
+	secretName string
+}
+
+func (comp *devfileComp) getOwnerRef() v1.OwnerReference {
+	panic("implement me")
+}
+func (comp *devfileComp) getLabels() map[string]string {
+	// compute a new copy of the component's labels
+	panic("implement me")
+}
+
+func (comp *devfileComp) GetURLs() map[string]url {
+	return comp.urls
+}
+
+func (comp *devfileComp) GetName() string {
+	panic("implement me")
+}
+
+func (comp *devfileComp) GetApplication() string {
+	panic("implement me")
+}
+
+func (comp *devfileComp) AddUrl(infoURL *envinfo.EnvInfoURL) url {
+	switch infoURL.Kind {
+	case envinfo.INGRESS:
+		return newNonPushedIngress(infoURL, comp)
+	}
+	return nil
+}
+
+func (comp *devfileComp) Push() error {
+	// push/create the component representation if needed
+	// ...
+
+	// push URLs if needed
+	for _, url := range comp.GetURLs() {
+		switch s := url.GetStatus().State; s {
+		case StateTypeLocallyDeleted:
+			url.Delete()
+		case StateTypeNotPushed:
+		case StateTypeUnknown:
+		case StateTypePushed:
+			url.CreateOrUpdate()
+		default:
+			return fmt.Errorf("unknown url state '%s'", s)
+		}
+	}
+
+	// ...
+	return nil
+}
+
+type devfileURL struct {
+	parent *devfileComp
+	name   string
+}
+
+func (u *devfileURL) getOwnerRef() v1.OwnerReference {
+	return u.parent.getOwnerRef()
+}
+
+func (u *devfileURL) getLabels() map[string]string {
+	labels := u.parent.getLabels()
+	labels[urlLabels.URLLabel] = u.name
+	return labels
+}
+
+func (u *devfileURL) getSecretLabels() map[string]string {
+	return u.parent.getLabels()
+}
+
+func (u *devfileURL) setSecret(secret string) {
+	panic("implement me")
+}
+
 type url interface {
-	Create() error
+	CreateOrUpdate() error
 	Delete() error
 	GetName() string
 	GetHost() string
 	GetProtocol() string
 	GetPort() int
 	IsSecure() bool
-	GetKind() URLKind
+	GetKind() envinfo.URLKind
 	GetTLSSecret() string
 	GetPath() string
 	GetStatus() URLStatus
+	GetParent() comp
 }
-
-type URLKind string
-
-const (
-	INGRESS URLKind = "ingress"
-	ROUTE   URLKind = "route"
-)
 
 func Coalescing(a, b interface{}) interface{} {
 	if a != nil {
@@ -58,9 +138,12 @@ func NewPushedURL(data interface{}, localState envinfo.EnvInfoURL) url {
 }
 
 type ingressURL struct {
-	component  component.KubernetesComponent
+	*devfileURL
 	localState *envinfo.EnvInfoURL
-	ingress    *iextensionsv1.Ingress
+}
+
+func (i ingressURL) GetParent() comp {
+	panic("implement me")
 }
 
 func (i ingressURL) Delete() error {
@@ -71,11 +154,13 @@ func (i ingressURL) Delete() error {
 	return client.DeleteIngress(i.localState.Name)
 }
 
-func NewNonPushedIngress(localState *envinfo.EnvInfoURL, kubernetesComponent component.KubernetesComponent) url {
+func newNonPushedIngress(localState *envinfo.EnvInfoURL, parent *devfileComp) url {
 	return ingressURL{
-		component:  kubernetesComponent,
+		devfileURL: &devfileURL{
+			parent: parent,
+			name:   localState.Name, // this needs to be cleaned up
+		},
 		localState: localState,
-		ingress:    nil,
 	}
 }
 
@@ -86,66 +171,60 @@ func NewIngress(ingress *iextensionsv1.Ingress, localState *envinfo.EnvInfoURL) 
 	}
 }
 
-func (i ingressURL) Create() error {
+func (i ingressURL) CreateOrUpdate() error {
 	client, err := kclient.GetInstance()
 	if err != nil {
 		return err
 	}
 
-	labels := urlLabels.GetLabels(i.localState.Name, i.component.GetName(), i.component.GetApplication(), true)
+	serviceName := i.GetName()
 
 	if i.localState.Host == "" {
 		return errors.Errorf("the host cannot be empty")
 	}
-	serviceName := i.component.GetName()
 	ingressDomain := fmt.Sprintf("%v.%v", i.localState.Name, i.localState.Host)
 
-	ownerReference := i.component.GetOwnerReference()
-	if i.localState.Secure {
-		if len(i.localState.TLSSecret) != 0 {
-			_, err := client.KubeClient.CoreV1().Secrets(client.Namespace).Get(i.localState.TLSSecret, metav1.GetOptions{})
-			if err != nil {
-				return errors.Wrap(err, "unable to get the provided secret: "+i.localState.TLSSecret)
-			}
-		}
-		if len(i.localState.TLSSecret) == 0 {
-			defaultTLSSecretName := i.component.GetName() + "-tlssecret"
+	ownerReference := i.getOwnerRef()
+	if i.IsSecure() {
+		secret := i.GetTLSSecret()
+		if len(secret) == 0 {
+			defaultTLSSecretName := serviceName + "-tlssecret"
 			_, err := client.KubeClient.CoreV1().Secrets(client.Namespace).Get(defaultTLSSecretName, metav1.GetOptions{})
 			// create tls secret if it does not exist
 			if kerrors.IsNotFound(err) {
-				selfsignedcert, err := kclient.GenerateSelfSignedCertificate(i.localState.Host)
+				selfsignedcert, err := kclient.GenerateSelfSignedCertificate(i.GetHost())
 				if err != nil {
 					return errors.Wrap(err, "unable to generate self-signed certificate for clutser: "+i.localState.Host)
 				}
 				// create tls secret
-				secretlabels := componentlabels.GetLabels(i.component.GetName(), i.component.GetApplication(), true)
 				objectMeta := metav1.ObjectMeta{
 					Name:   defaultTLSSecretName,
-					Labels: secretlabels,
+					Labels: i.getSecretLabels(),
 					OwnerReferences: []v1.OwnerReference{
 						ownerReference,
 					},
 				}
-				secret, err := client.CreateTLSSecret(selfsignedcert.CertPem, selfsignedcert.KeyPem, objectMeta)
-				if err != nil {
-					return errors.Wrap(err, "unable to create tls secret")
+				if _, err := client.CreateTLSSecret(selfsignedcert.CertPem, selfsignedcert.KeyPem, objectMeta); err != nil {
+					return errors.Wrap(err, "unable to create tls secret "+defaultTLSSecretName)
 				}
-				i.localState.TLSSecret = secret.Name
 			} else if err != nil {
 				return err
-			} else {
-				// tls secret found for this component
-				i.localState.TLSSecret = defaultTLSSecretName
 			}
-
+			i.setSecret(defaultTLSSecretName)
+		} else {
+			// maybe we should assume at this point that the secret exists, since it should have been validated before?
+			_, err := client.KubeClient.CoreV1().Secrets(client.Namespace).Get(secret, metav1.GetOptions{})
+			if err != nil {
+				return errors.Wrap(err, "unable to get the provided secret: "+secret)
+			}
 		}
 
 	}
 	ingressParam := kclient.IngressParameter{ServiceName: serviceName, IngressDomain: ingressDomain, PortNumber: intstr.FromInt(i.localState.Port), TLSSecretName: i.localState.TLSSecret, Path: i.localState.Path}
 	ingressSpec := kclient.GenerateIngressSpec(ingressParam)
-	objectMeta := kclient.CreateObjectMeta(i.component.GetName(), client.Namespace, labels, nil)
+	objectMeta := kclient.CreateObjectMeta(serviceName, client.Namespace, i.getLabels(), nil)
 	// to avoid error due to duplicate ingress name defined in different devfile components
-	objectMeta.Name = fmt.Sprintf("%s-%s", i.localState.Name, i.component.GetName())
+	objectMeta.Name = fmt.Sprintf("%s-%s", i.GetName(), serviceName)
 	objectMeta.OwnerReferences = append(objectMeta.OwnerReferences, ownerReference)
 	// Pass in the namespace name, link to the service (componentName) and labels to create a ingress
 	_, err = client.CreateIngress(objectMeta, *ingressSpec)
@@ -294,7 +373,7 @@ func (k kubernetesClient) Create(url envinfo.EnvInfoURL, cmp component.OdoCompon
 	if url.Kind == envinfo.INGRESS {
 		if kubeCmp, ok := cmp.(component.KubernetesComponent); ok {
 			url := NewNonPushedIngress(&url, kubeCmp)
-			return url.Create()
+			return url.CreateOrUpdate()
 		}
 	}
 	return nil
@@ -307,7 +386,7 @@ func URLPush(client urlClient) error {
 		if url.GetStatus().State == StateTypeLocallyDeleted {
 			url.Delete()
 		} else if url.GetStatus().State == StateTypeNotPushed {
-			url.Create()
+			url.CreateOrUpdate()
 		}
 	}
 	return nil
